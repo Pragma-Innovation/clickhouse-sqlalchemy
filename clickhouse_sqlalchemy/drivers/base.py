@@ -156,6 +156,151 @@ class ClickHouseCompiler(compiler.SQLCompiler):
             join.right._compiler_dispatch(self, asfrom=True, **kwargs) +
             " USING " + join.onclause._compiler_dispatch(self, **kwargs)
         )
+    
+    def visit_select(self, select, asfrom=False, parens=True,
+                     fromhints=None,
+                     compound_index=0,
+                     nested_join_translation=False,
+                     select_wraps_for=None,
+                     lateral=False,
+                     **kwargs):
+
+        needs_nested_translation = \
+            select.use_labels and \
+            not nested_join_translation and \
+            not self.stack and \
+            not self.dialect.supports_right_nested_joins
+
+        if needs_nested_translation:
+            transformed_select = self._transform_select_for_nested_joins(
+                select)
+            text = self.visit_select(
+                transformed_select, asfrom=asfrom, parens=parens,
+                fromhints=fromhints,
+                compound_index=compound_index,
+                nested_join_translation=True, **kwargs
+            )
+
+        toplevel = not self.stack
+        entry = self._default_stack_entry if toplevel else self.stack[-1]
+
+        populate_result_map = toplevel or \
+            (
+                compound_index == 0 and entry.get(
+                    'need_result_map_for_compound', False)
+            ) or entry.get('need_result_map_for_nested', False)
+
+        # this was first proposed as part of #3372; however, it is not
+        # reached in current tests and could possibly be an assertion
+        # instead.
+        if not populate_result_map and 'add_to_result_map' in kwargs:
+            del kwargs['add_to_result_map']
+
+        if needs_nested_translation:
+            if populate_result_map:
+                self._transform_result_map_for_nested_joins(
+                    select, transformed_select)
+            return text
+
+        froms = self._setup_select_stack(select, entry, asfrom, lateral)
+
+        column_clause_args = kwargs.copy()
+        column_clause_args.update({
+            'within_label_clause': False,
+            'within_columns_clause': False
+        })
+
+        text = "SELECT "  # we're off to a good start !
+
+        if select._hints:
+            hint_text, byfrom = self._setup_select_hints(select)
+            if hint_text:
+                text += hint_text + " "
+        else:
+            byfrom = None
+
+        if select._prefixes:
+            text += self._generate_prefixes(
+                select, select._prefixes, **kwargs)
+
+        text += self.get_select_precolumns(select, **kwargs)
+        # the actual list of columns to print in the SELECT column list.
+        inner_columns = [
+            c for c in [
+                self._label_select_column(
+                    select,
+                    column,
+                    populate_result_map, asfrom,
+                    column_clause_args,
+                    name=name)
+                for name, column in select._columns_plus_names
+            ]
+            if c is not None
+        ]
+
+        #Here we apply the clickhouse functions which convert binary IP to String ip
+        #We use the name of the column to know if the data is an ip data or not
+        modified_inner_columns = []
+
+        for c in inner_columns:
+            c_temp = c.split(" ")
+            
+            if c.lower().startswith("ip_v4_") and c_temp[0] == c_temp[2]:
+                c = c.split(" ")
+                c[0] = "IPv4NumToString({})".format(c[0])
+                modified_inner_columns.append(" ".join(c))
+            
+            elif c.lower().startswith("ip_v6_") and c_temp[0] == c_temp[2]:
+                c = c.split(" ")
+                c[0] = "IPv6NumToString({})".format(c[0])
+                modified_inner_columns.append(" ".join(c))
+            
+            else:
+                modified_inner_columns.append(c)
+
+
+        if populate_result_map and select_wraps_for is not None:
+            # if this select is a compiler-generated wrapper,
+            # rewrite the targeted columns in the result map
+
+            translate = dict(
+                zip(
+                    [name for (key, name) in select._columns_plus_names],
+                    [name for (key, name) in
+                     select_wraps_for._columns_plus_names])
+            )
+
+            self._result_columns = [
+                (key, name, tuple(translate.get(o, o) for o in obj), type_)
+                for key, name, obj, type_ in self._result_columns
+            ]
+
+        text = self._compose_select_body(
+            text, select, modified_inner_columns, froms, byfrom, kwargs)
+
+        if select._statement_hints:
+            per_dialect = [
+                ht for (dialect_name, ht)
+                in select._statement_hints
+                if dialect_name in ('*', self.dialect.name)
+            ]
+            if per_dialect:
+                text += " " + self.get_statement_hint_text(per_dialect)
+
+        if self.ctes and toplevel:
+            text = self._render_cte_clause() + text
+
+        if select._suffixes:
+            text += " " + self._generate_prefixes(
+                select, select._suffixes, **kwargs)
+
+        self.stack.pop(-1)
+
+        if (asfrom or lateral) and parens:
+            return "(" + text + ")"
+        else:
+            return text
+    
 
     def _compose_select_body(
             self, text, select, inner_columns, froms, byfrom, kwargs):
