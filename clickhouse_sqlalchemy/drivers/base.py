@@ -254,7 +254,13 @@ class ClickHouseCompiler(compiler.SQLCompiler):
                 c = c.split(" ")
                 c[0] = "IPv6NumToString({})".format(c[0])
                 modified_inner_columns.append(" ".join(c))
-            
+
+            #We can apply the function which converts the mac address number to string
+            elif c.lower().startswith("mac_addr_") and c_temp[0] == c_temp[2]:
+                c = c.split(" ")
+                c[0] = "MacNumToString({})".format(c[0]) 
+                modified_inner_columns.append(" ".join(c))
+
             else:
                 modified_inner_columns.append(c)
 
